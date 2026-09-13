@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"strconv"
@@ -43,8 +44,30 @@ func usersHandler(w http.ResponseWriter, r *http.Request) {
 
 	switch r.Method {
 	case "GET":
+		rows, err := db.Query(context.Background(), "SELECT id, name, age FROM users")
+
+		if err != nil {
+			http.Error(w, "Ошибка базы данных", http.StatusInternalServerError)
+			return
+		}
+
+		defer rows.Close()
+
+		users := []User{}
+
+		for rows.Next() {
+			var user User
+
+			err := rows.Scan(&user.ID, &user.Name, &user.Age)
+
+			if err != nil {
+				http.Error(w, "Ошибка чтения данных", http.StatusInternalServerError)
+				return
+			}
+			users = append(users, user)
+
+		}
 		w.Header().Set("Content-Type", "application/json")
-		//w.WriteHeader(http.StatusOK) /// должно быть ниже w header не нужна отправка кодер сам послает автоматически ok and bad
 		json.NewEncoder(w).Encode(users)
 
 	case "POST":
@@ -61,17 +84,23 @@ func createUserHandler(w http.ResponseWriter, r *http.Request) {
 	err := json.NewDecoder(r.Body).Decode(&user)
 
 	if err != nil {
-		http.Error(w, "Некоректный JSON", http.StatusBadRequest)
+		http.Error(w, "Некорректный JSON", http.StatusBadRequest)
 		return
 	}
 
-	user.ID = nextID
-	nextID++
-	users = append(users, user)
+	err = db.QueryRow(
+		context.Background(),
+		"INSERT INTO users (name, age) VALUES ($1, $2) RETURNING id",
+		user.Name,
+		user.Age,
+	).Scan(&user.ID)
 
-	fmt.Println("========================================================")
-	fmt.Println("Новый пользователь: " + user.Name + "\nВозраст: " + strconv.Itoa(user.Age) + "\nID: " + strconv.Itoa(user.ID))
-	fmt.Println("========================================================")
+	if err != nil {
+		http.Error(w, "Ошибка базы данных", http.StatusInternalServerError)
+		return
+	}
+
+	fmt.Println("Новый пользователь:", user)
 
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusCreated)
@@ -89,49 +118,70 @@ func userByIDHandler(w http.ResponseWriter, r *http.Request) {
 	}
 
 	switch r.Method {
-	case "DELETE":
 
-		if !deleteUser(id) {
+	case "GET":
+		var user User
+
+		err = db.QueryRow(
+			context.Background(),
+			"SELECT id, name, age FROM users WHERE id = $1",
+			id,
+		).Scan(&user.ID, &user.Name, &user.Age)
+
+		if err != nil {
 			http.Error(w, "Пользователь не найден", http.StatusNotFound)
 			return
 		}
-		w.WriteHeader(http.StatusOK) // правильно тут
-		fmt.Fprintln(w, "Пользователь удален")
-		//w.WriteHeader(http.StatusOK) /// 200 status
 
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(user)
+		return
+
+	case "DELETE":
+		deleted, err := deleteUser(id)
+
+		if err != nil {
+			http.Error(w, "Ошибка базы данных", http.StatusInternalServerError)
+			return
+		}
+
+		if !deleted {
+			http.Error(w, "Пользователь не найден", http.StatusNotFound)
+			return
+		}
+
+		w.WriteHeader(http.StatusOK)
+		fmt.Fprintln(w, "Пользователь удален")
 		return
 
 	case "PUT":
 		updateUserHandler(w, r, id)
-		fmt.Println("Пользователь обновлен")
-
 		return
 
 	case "PATCH":
 		patchUserHandler(w, r, id)
 		return
-	}
 
-	for _, user := range users {
-		if user.ID == id {
-			w.Header().Set("Content-Type", "application/json")
-			json.NewEncoder(w).Encode(user)
-			return
-		}
+	default:
+		http.Error(w, "Метод не поддерживается", http.StatusMethodNotAllowed)
+		return
 	}
-
-	http.Error(w, "Пользователь не найден", http.StatusNotFound)
 }
 
-func deleteUser(id int) bool {
-	for i, user := range users {
-		if user.ID == id {
-			users = append(users[:i], users[i+1:]...)
-			return true
-		}
+func deleteUser(id int) (bool, error) {
+	result, err := db.Exec(
+		context.Background(),
+		"DELETE FROM users WHERE id = $1",
+		id,
+	)
+
+	if err != nil {
+		return false, err
 	}
-	return false
+
+	return result.RowsAffected() > 0, nil
 }
+
 func updateUserHandler(w http.ResponseWriter, r *http.Request, id int) {
 	var user User
 
@@ -142,19 +192,28 @@ func updateUserHandler(w http.ResponseWriter, r *http.Request, id int) {
 		return
 	}
 
-	for i := range users {
-		if users[i].ID == id {
-			users[i].Name = user.Name
-			users[i].Age = user.Age
+	err = db.QueryRow(
+		context.Background(),
+		"UPDATE users SET name = $1, age = $2 WHERE id = $3 RETURNING id, name, age",
+		user.Name,
+		user.Age,
+		id,
+	).Scan(&user.ID, &user.Name, &user.Age)
 
-			w.Header().Set("Content-Type", "application/json")
-			w.WriteHeader(http.StatusOK) // правильно тут а не в кейсе
-			json.NewEncoder(w).Encode(users[i])
-			fmt.Println(user)
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			http.Error(w, "Пользователь не найден", http.StatusNotFound)
 			return
 		}
+
+		http.Error(w, "Ошибка базы данных", http.StatusInternalServerError)
+		return
 	}
-	http.Error(w, "Пользователь не найден", http.StatusNotFound)
+
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusOK)
+
+	json.NewEncoder(w).Encode(user)
 }
 func patchUserHandler(w http.ResponseWriter, r *http.Request, id int) {
 	var update UpdateUser
@@ -162,27 +221,38 @@ func patchUserHandler(w http.ResponseWriter, r *http.Request, id int) {
 	err := json.NewDecoder(r.Body).Decode(&update)
 
 	if err != nil {
-		http.Error(w, "Неверный JSON", http.StatusBadRequest)
+		http.Error(w, "Некорректный JSON", http.StatusBadRequest)
 		return
 	}
 
-	for i := range users {
-		if users[i].ID == id {
-			if update.Name != nil {
-				users[i].Name = *update.Name
-			}
+	var user User
 
-			if update.Age != nil {
-				users[i].Age = *update.Age
-			}
+	err = db.QueryRow(
+		context.Background(),
+		`UPDATE users
+		 SET name = COALESCE($1, name),
+		     age = COALESCE($2, age)
+		 WHERE id = $3
+		 RETURNING id, name, age`,
+		update.Name,
+		update.Age,
+		id,
+	).Scan(&user.ID, &user.Name, &user.Age)
 
-			w.Header().Set("Content-Type", "application/json")
-			json.NewEncoder(w).Encode(users[i])
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			http.Error(w, "Пользователь не найден", http.StatusNotFound)
 			return
 		}
+
+		http.Error(w, "Ошибка базы данных", http.StatusInternalServerError)
+		return
 	}
 
-	http.Error(w, "Пользователь не найден", http.StatusNotFound)
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusOK)
+
+	json.NewEncoder(w).Encode(user)
 }
 
 func main() {
@@ -198,6 +268,8 @@ func main() {
 	defer db.Close(context.Background())
 
 	http.HandleFunc("/user", userHandler)
+	http.HandleFunc("/users", usersHandler)
+	http.HandleFunc("/users/", userByIDHandler)
 
 	fmt.Println("Server start on :8080")
 	err = http.ListenAndServe(":8080", nil)
